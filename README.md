@@ -28,7 +28,7 @@ Edit `config.json`:
 ```json
 {
   "SLACK_BOT_TOKEN": "xoxb-...",          // token with files:write scope
-  "SLACK_CHANNEL_ID": "C093LUWB19B"       // provided channel ID
+  "SLACK_CHANNEL_ID": "channel-id"        // target channel ID
 }
 ```
 
@@ -38,7 +38,7 @@ Copy `.env.example` to `.env` and fill in values if you don't want a config file
 
 ```
 SLACK_BOT_TOKEN=xoxb-...
-SLACK_CHANNEL_ID=C093LUWB19B
+SLACK_CHANNEL_ID=channel-id
 ```
 
 Precedence: `config.json` → `.env`/environment.
@@ -47,14 +47,20 @@ Place your resume PDF somewhere locally, e.g., `./resume.pdf`.
 
 ### 3) Run uploader
 
+Uses `files.uploadV2` primarily. If unavailable in your workspace, it automatically falls back to the external upload flow (`files.getUploadURLExternal` + `files.completeUploadExternal`). After upload, it posts a clickable message with the file link.
+
 ```bash
-python uploader.py --file ./resume.pdf
+python uploader.py --file "./resume.pdf" --comment "Submitting my resume"
 ```
 
 Options:
 
 ```bash
-python uploader.py --file ./resume.pdf --channel C093LUWB19B --comment "Submitting my resume"
+# Override channel and print HTTP payloads (token masked)
+python uploader.py --file "./resume.pdf" \
+  --channel C0123456789 \
+  --comment "Submitting my resume" \
+  --debug
 ```
 
 If `--channel` is omitted, the script uses `SLACK_CHANNEL_ID` from `config.json` or `.env`.
@@ -63,39 +69,59 @@ If `--channel` is omitted, the script uses `SLACK_CHANNEL_ID` from `config.json`
 
 ## API Choice and Rationale
 
-- **Endpoint**: `POST https://slack.com/api/files.upload`
-- **Why**: Purpose-built to upload and share files in channels. Supports multipart uploads, `channels` parameter to share into a channel, and `initial_comment`.
-- **Auth**: Bearer token via `Authorization: Bearer <token>` header. Token must have `files:write` scope and the app/bot must be a member of the target channel.
+- **Primary**: `POST https://slack.com/api/files.uploadV2` (recommended modern upload)
+- **Fallback**: `files.getUploadURLExternal` → PUT bytes → `files.completeUploadExternal`
+- **Message**: `chat.postMessage` to post a clickable link to the uploaded file
+- **Auth**: Bearer token (`xoxb-...`) with `files:write` scope; bot must be in the target channel.
 
 Key parameters used:
-- `file` (multipart): the PDF binary
-- `channels`: destination channel ID
-- `initial_comment` (optional): message text alongside the file
+- `file` (multipart) and `channel_id` (for V2)
+- `filename`, `length` (for external pre-signed URL)
+- `files`, `channel_id`, `initial_comment` (for complete)
 
 ---
 
 ## Workflow (Steps Taken)
 
-1. Receive the Slack token (via email per assignment).
+1. Receive Slack token and ensure it is a `xoxb-` Bot token with `files:write`.
 2. Put token and channel into `config.json` (or `.env` fallback).
-3. Run `uploader.py` pointing to your local PDF.
-4. Verify success by checking non-200 responses and `ok: true` in Slack API JSON.
+3. Script attempts `conversations.join` (public channels) to avoid `not_in_channel`.
+4. Upload via `files.uploadV2`; if not available, use external upload flow.
+5. Post a message with a clickable link to the uploaded file.
 
 ---
 
-## Code Snippet (Python)
+## Code Snippet (Core calls)
 
 ```python
-# uploader.py (core call)
-resp = requests.post(
-    "https://slack.com/api/files.upload",
+# files.uploadV2
+requests.post(
+    "https://slack.com/api/files.uploadV2",
     headers={"Authorization": f"Bearer {token}"},
-    data={
-        "channels": channel_id,
-        "initial_comment": initial_comment or "",
-    },
+    data={"channel_id": channel_id, "initial_comment": initial_comment or ""},
     files={"file": (Path(file_path).name, open(file_path, "rb"), "application/pdf")},
-    timeout=30,
+)
+
+# External upload (fallback)
+# 1) get URL
+requests.post(
+    "https://slack.com/api/files.getUploadURLExternal",
+    headers={"Authorization": f"Bearer {token}"},
+    data={"filename": file_name, "length": str(size)},
+)
+# 2) PUT bytes to returned upload_url
+# 3) complete upload
+requests.post(
+    "https://slack.com/api/files.completeUploadExternal",
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    data=json.dumps({"files": [{"id": file_id, "title": file_name}], "channel_id": channel_id}),
+)
+
+# Post a clickable link
+requests.post(
+    "https://slack.com/api/chat.postMessage",
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    data=json.dumps({"channel": channel_id, "text": f"<{permalink}|Resume> submitted successfully!"}),
 )
 ```
 
@@ -103,39 +129,34 @@ resp = requests.post(
 
 ## Alternate Methods
 
-- **curl**
+- **curl** (V2)
 
 ```bash
 curl -F file=@./resume.pdf \
-  -F channels=C093LUWB19B \
+  -F channel_id=C0123456789 \
   -F initial_comment="Submitting my resume" \
   -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-  https://slack.com/api/files.upload
+  https://slack.com/api/files.uploadV2
 ```
 
-- **Postman**
+- **curl** (external flow)
 
-Create a POST request to `https://slack.com/api/files.upload` with:
-- Auth: Bearer Token = `SLACK_BOT_TOKEN`
-- Body: form-data
-  - Key `file` type File -> choose your PDF
-  - Key `channels` = `C093LUWB19B`
-  - Key `initial_comment` (optional)
+Use the API calls above via `curl` or Postman: first `files.getUploadURLExternal`, then PUT to `upload_url`, then `files.completeUploadExternal`.
 
 ---
 
 ## Troubleshooting / Learnings
 
-- **not_in_channel**: Invite the app/bot to the channel or post once to auto-join.
-- **invalid_auth**: Token is wrong or missing `files:write` scope.
-- **file_uploads_disabled**: Workspace policy may restrict uploads.
-- **Rate limits**: Respect `Retry-After` header and backoff on HTTP 429.
+- **not_in_channel**: Invite the app/bot to the channel or grant `channels:join` and reinstall.
+- **invalid_auth/missing_scope**: Ensure a Bot token (`xoxb-...`) with `files:write` and reinstall after scope changes.
+- **method_deprecated / unknown_method**: Workspace doesn’t support the attempted method; the script falls back automatically.
+- **Rate limits (429)**: Backoff and honor `Retry-After`.
 
 ---
 
 ## Evaluation Checklist Mapping
 
-- **Clarity and correctness of API usage**: Uses `files.upload` with proper headers and multipart.
-- **Quality of documentation**: This README covers setup, usage, API choice, and examples.
-- **Problem-solving & reasoning**: Minimal dependencies, robust error messages, validation of inputs.
-- **Completeness**: Script uploads a PDF to the specified Slack channel and reports the result.
+- **Clarity and correctness of API usage**: Uses `files.uploadV2` with proper headers and multipart; robust fallback implemented.
+- **Quality of documentation**: Setup, usage, API choices, and examples included.
+- **Problem-solving & reasoning**: Handles workspace differences with automatic fallback; debug visibility via `--debug`.
+- **Completeness**: Uploads the PDF, posts a message with the file link, and prints IDs/permalink.
