@@ -155,32 +155,3 @@ requests.post(
     }),
 )
 ```
-
----
-
-## Alternate Methods
-
-- **curl** (V2)
-
-```bash
-curl -F file=@./resume.pdf \
-  -F channel_id=C0123456789 \
-  -F initial_comment="Submitting my resume" \
-  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-  https://slack.com/api/files.uploadV2
-```
-
-- **curl** (external flow)
-
-Use the API calls above via `curl` or Postman: first `files.getUploadURLExternal`, then PUT to `upload_url`, then `files.completeUploadExternal`.
-
----
-
-## Troubleshooting / Learnings
-
-- **not_in_channel**: Invite the app/bot to the channel or grant `channels:join` and reinstall.
-- **invalid_auth/missing_scope**: Ensure a Bot token (`xoxb-...`) with `files:write`, `files:read`, and `chat:write`, then reinstall after scope changes.
-- **permalink missing**: Ensure `files:read` is granted so `files.info` can return the permalink.
-- **method_deprecated / unknown_method**: Workspace doesn’t support the attempted method; the script falls back automatically.
-- **Rate limits (429)**: Backoff and honor `Retry-After`.
-
